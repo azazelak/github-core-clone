@@ -1,71 +1,40 @@
-// Entry lifecycle: bind an ephemeral port, announce it to the env, wait for
-// the env to finish, then exit. The server itself lives in app.ts.
-import { createApp } from './app.ts';
+// Launcher: the trial runs Node 22 main.ts; this spawns the prebuilt
+// static Go binary ./forge. The entry files may be stored read-only and
+// without the exec bit (browser upload sets 644), so the binary is copied
+// to a tmp file, chmod 755, and spawned from there. main.ts binds no port;
+// the Go binary owns the lifecycle (bind port 0, register, poll /done).
+import { spawn } from 'node:child_process';
+import { chmodSync, copyFileSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const envUrl = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-if (envUrl === '') {
-  process.stderr.write('[forge] MAKEFUN_ENV_URL is not set\n');
-  process.exit(1);
-}
-
-const wait = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
-async function announce(port: number): Promise<void> {
-  let attempt = 0;
-  for (;;) {
-    try {
-      const res = await fetch(`${envUrl}/register`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ port }),
-        signal: AbortSignal.timeout(30_000),
-      });
-      if (res.status === 200 || res.status === 409) return;
-      if (res.status === 400 || res.status === 405) {
-        throw new Error(`register refused with HTTP ${res.status}`);
-      }
-    } catch (err) {
-      if (err instanceof Error && err.message.startsWith('register refused')) throw err;
-    }
-    await wait(Math.min(2000, 250 * 2 ** Math.min(attempt++, 8)));
-  }
-}
-
-async function waitDone(): Promise<void> {
-  let attempt = 0;
-  for (;;) {
-    try {
-      const res = await fetch(`${envUrl}/done`, { signal: AbortSignal.timeout(30_000) });
-      if (res.ok) {
-        const body = (await res.json()) as { done?: unknown };
-        if (body.done === true) return;
-      }
-    } catch {
-      // env not answering yet: keep polling.
-    }
-    await wait(Math.min(2000, 250 * 2 ** Math.min(attempt++, 8)));
-  }
-}
-
-async function run(): Promise<void> {
-  const server = createApp();
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, () => resolve());
-  });
-  const addr = server.address();
-  if (addr === null || typeof addr === 'string') throw new Error('no TCP port bound');
-  process.stdout.write(`[forge] listening on ${addr.port}\n`);
-  await announce(addr.port);
-  process.stdout.write('[forge] registered\n');
-  await waitDone();
-  server.close();
-}
-
+const here = dirname(fileURLToPath(import.meta.url));
+let bin: string;
 try {
-  await run();
-  process.exit(0);
+  const dir = mkdtempSync(join(tmpdir(), 'forge-'));
+  bin = join(dir, 'forge');
+  copyFileSync(join(here, 'forge'), bin);
+  chmodSync(bin, 0o755);
 } catch (err) {
-  process.stderr.write(`[forge] ${err instanceof Error ? err.message : String(err)}\n`);
+  process.stderr.write(`[launcher] cannot stage forge binary: ${err instanceof Error ? err.message : String(err)}\n`);
   process.exit(1);
 }
+
+const child = spawn(bin, [], { stdio: 'inherit', env: process.env });
+child.on('error', (err) => {
+  process.stderr.write(`[launcher] spawn failed: ${err.message}\n`);
+  process.exit(1);
+});
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+  process.on(sig, () => {
+    child.kill(sig);
+  });
+}
+child.on('exit', (code, signal) => {
+  if (signal) {
+    process.kill(process.pid, signal);
+    return;
+  }
+  process.exit(code ?? 1);
+});
