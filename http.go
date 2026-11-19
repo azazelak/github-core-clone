@@ -14,21 +14,51 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
+
+// reqSeq hands out sequential X-GitHub-Request-Id values without taking
+// the store mutex (request ids are wire metadata, not recorded state).
+var reqSeq atomic.Int64
 
 type req struct {
 	method  string
 	rawPath string // path as sent, percent-encoded
 	path    string // raw path (segments decoded at use sites, like v1)
 	query   url.Values
-	headers map[string]string
+	hdrs    [24][2]string // header name/value pairs, raw case
+	nHdrs   int
+	xHdrs   [][2]string // overflow when a request carries >24 headers
 	host    string
 	rawTgt  string
 	body    []byte
 	close   bool
 }
 
-func (q *req) header(name string) string { return q.headers[strings.ToLower(name)] }
+// header returns the last value sent for name (case-insensitive), or "".
+func (q *req) header(name string) string {
+	v := ""
+	for i := 0; i < q.nHdrs; i++ {
+		if strings.EqualFold(q.hdrs[i][0], name) {
+			v = q.hdrs[i][1]
+		}
+	}
+	for _, h := range q.xHdrs {
+		if strings.EqualFold(h[0], name) {
+			v = h[1]
+		}
+	}
+	return v
+}
+
+func (q *req) addHeader(name, value string) {
+	if q.nHdrs < len(q.hdrs) {
+		q.hdrs[q.nHdrs] = [2]string{name, value}
+		q.nHdrs++
+	} else {
+		q.xHdrs = append(q.xHdrs, [2]string{name, value})
+	}
+}
 
 type resp struct {
 	status int
@@ -65,23 +95,32 @@ func writeResp(w *bufio.Writer, r *req, rs *resp) {
 	if !ok {
 		text = "OK"
 	}
-	var b bytes.Buffer
-	b.WriteString("HTTP/1.1 " + strconv.Itoa(rs.status) + " " + text + "\r\n")
+	var num [32]byte
+	w.WriteString("HTTP/1.1 ")
+	w.Write(strconv.AppendInt(num[:0], int64(rs.status), 10))
+	w.WriteString(" ")
+	w.WriteString(text)
+	w.WriteString("\r\n")
 	if rs.ctype != "" {
-		b.WriteString("content-type: " + rs.ctype + "\r\n")
+		w.WriteString("content-type: ")
+		w.WriteString(rs.ctype)
+		w.WriteString("\r\n")
 	}
-	b.WriteString("content-length: " + strconv.Itoa(len(rs.body)) + "\r\n")
-	st.mu.Lock()
-	b.WriteString("x-github-request-id: " + st.nextReqID() + "\r\n")
-	st.mu.Unlock()
+	w.WriteString("content-length: ")
+	w.Write(strconv.AppendInt(num[:0], int64(len(rs.body)), 10))
+	w.WriteString("\r\nx-github-request-id: req-")
+	w.Write(strconv.AppendInt(num[:0], reqSeq.Add(1), 10))
+	w.WriteString("\r\n")
 	for k, v := range rs.extra {
-		b.WriteString(k + ": " + v + "\r\n")
+		w.WriteString(k)
+		w.WriteString(": ")
+		w.WriteString(v)
+		w.WriteString("\r\n")
 	}
 	if r.close {
-		b.WriteString("connection: close\r\n")
+		w.WriteString("connection: close\r\n")
 	}
-	b.WriteString("\r\n")
-	w.Write(b.Bytes())
+	w.WriteString("\r\n")
 	if len(rs.body) > 0 {
 		w.Write(rs.body)
 	}
@@ -135,9 +174,15 @@ func readRequest(br *bufio.Reader, bw *bufio.Writer) (*req, error) {
 	if len(parts) != 3 {
 		return nil, errBadRequest
 	}
-	rq := &req{method: parts[0], rawTgt: parts[1], headers: make(map[string]string)}
+	rq := &req{method: parts[0], rawTgt: parts[1]}
 	target := parts[1]
-	if u, err := url.Parse(target); err == nil {
+	// Fast path (the overwhelmingly common case: origin-form target with
+	// no query string and no percent-escapes): skip url.Parse entirely.
+	if strings.HasPrefix(target, "/") && !strings.ContainsAny(target, "?%") {
+		rq.rawPath = target
+		rq.path = target
+		rq.query = url.Values{}
+	} else if u, err := url.Parse(target); err == nil {
 		rq.rawPath = u.EscapedPath()
 		if rq.rawPath == "" {
 			rq.rawPath = u.Path
@@ -159,7 +204,7 @@ func readRequest(br *bufio.Reader, bw *bufio.Writer) (*req, error) {
 		}
 		hline = strings.TrimRight(hline, "\r\n")
 		if i := strings.IndexByte(hline, ':'); i > 0 {
-			rq.headers[strings.ToLower(strings.TrimSpace(hline[:i]))] = strings.TrimSpace(hline[i+1:])
+			rq.addHeader(strings.TrimSpace(hline[:i]), strings.TrimSpace(hline[i+1:]))
 		}
 	}
 	rq.host = rq.header("host")

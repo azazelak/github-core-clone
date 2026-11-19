@@ -133,13 +133,12 @@ func (r *repo) heldFromHaves(haves, shallowIn []string) map[string]bool {
 			continue
 		}
 		if o.typ == objCommit {
-			c := parseCommit(o.data)
 			held[oid] = true
-			for x := range r.reachable([]string{c.tree}) {
+			for x := range r.reachable([]string{o.commitTree()}) {
 				held[x] = true
 			}
 			if !boundary[oid] {
-				stack = append(stack, c.parents...)
+				stack = append(stack, o.commitParents()...)
 			}
 		} else {
 			for x := range r.reachable([]string{oid}) {
@@ -184,8 +183,7 @@ func (r *repo) planFetch(wants, haves, shallowIn []string, depth int) fetchPlan 
 		if !ok || o.typ != objCommit {
 			continue
 		}
-		c := parseCommit(o.data)
-		for x := range r.reachable([]string{c.tree}) {
+		for x := range r.reachable([]string{o.commitTree()}) {
 			send[x] = true
 		}
 		send[oid] = true
@@ -201,7 +199,7 @@ func (r *repo) planFetch(wants, haves, shallowIn []string, depth int) fetchPlan 
 	if depth >= 0 {
 		for oid, d := range dist {
 			if d == depth-1 {
-				if o, ok := r.Objects[oid]; ok && o.typ == objCommit && len(parseCommit(o.data).parents) > 0 {
+				if o, ok := r.Objects[oid]; ok && o.typ == objCommit && len(o.commitParents()) > 0 {
 					shallow = append(shallow, oid)
 				}
 			}
@@ -209,7 +207,7 @@ func (r *repo) planFetch(wants, haves, shallowIn []string, depth int) fetchPlan 
 		for _, s := range shallowIn {
 			if included[s] {
 				if o, ok := r.Objects[s]; ok && o.typ == objCommit {
-					parents := parseCommit(o.data).parents
+					parents := o.commitParents()
 					if len(parents) > 0 {
 						allIn := true
 						for _, p := range parents {
@@ -269,6 +267,58 @@ func (r *repo) buildFetchPack(plan fetchPlan, cacheKey string) []byte {
 	r.fetchCache[cacheKey] = pack
 	r.fetchOrder = append(r.fetchOrder, cacheKey)
 	return pack
+}
+
+// fetchResponse returns the complete fetch response bytes for a request
+// (acknowledgments, shallow/unshallow lines, sidebanded pack), cached on
+// the repo state version plus the full request arguments and the protocol
+// flavour. The response is fully determined by those inputs — the pack
+// bytes are deterministic (objects are sorted before packing) — so a
+// cache hit is byte-identical to a fresh computation, and a clone
+// repeated against an unchanged repo skips the whole plan + pack build.
+func (r *repo) fetchResponse(proto string, wants, haves, shallowIn []string, depth int, done bool) []byte {
+	key := fetchCacheKey(r.Ver, wants, haves, shallowIn, depth) + "|" + proto
+	if done {
+		key += "|done"
+	}
+	if cached, ok := r.fetchRespCache[key]; ok {
+		return cached
+	}
+	plan := r.planFetch(wants, haves, shallowIn, depth)
+	pack := r.buildFetchPack(plan, fetchCacheKey(r.Ver, wants, haves, shallowIn, depth))
+	var buf bytes.Buffer
+	if proto == "v2" {
+		if !done {
+			buf.Write(pktStr("acknowledgments\n"))
+			buf.Write(pktStr("NAK\n"))
+			buf.Write(pktStr("ready\n"))
+			buf.Write(delimPkt)
+		}
+		buf.Write(pktStr("shallow-info\n"))
+	} else {
+		buf.Write(pktStr("NAK\n"))
+	}
+	for _, s := range plan.shallow {
+		buf.Write(pktStr("shallow " + s + "\n"))
+	}
+	for _, s := range plan.unshallow {
+		buf.Write(pktStr("unshallow " + s + "\n"))
+	}
+	if proto == "v2" {
+		buf.Write(delimPkt)
+		buf.Write(pktStr("packfile\n"))
+	}
+	buf.Write(sidebandPack(pack))
+	buf.Write(flushPkt)
+	out := buf.Bytes()
+	if len(r.fetchRespCache) >= 128 {
+		old := r.fetchRespOrder[0]
+		r.fetchRespOrder = r.fetchRespOrder[1:]
+		delete(r.fetchRespCache, old)
+	}
+	r.fetchRespCache[key] = out
+	r.fetchRespOrder = append(r.fetchRespOrder, key)
+	return out
 }
 
 func fetchCacheKey(ver uint64, wants, haves, shallowIn []string, depth int) string {
@@ -336,28 +386,7 @@ func handleFetchV2(r *repo, body []byte) []byte {
 		}
 		return lsRefsResponse(r, prefixes, peel, symrefs, unborn)
 	}
-	plan := r.planFetch(wants, haves, shallowIn, depth)
-	key := fetchCacheKey(r.Ver, wants, haves, shallowIn, depth)
-	pack := r.buildFetchPack(plan, key)
-	var buf bytes.Buffer
-	if !done {
-		buf.Write(pktStr("acknowledgments\n"))
-		buf.Write(pktStr("NAK\n"))
-		buf.Write(pktStr("ready\n"))
-		buf.Write(delimPkt)
-	}
-	buf.Write(pktStr("shallow-info\n"))
-	for _, s := range plan.shallow {
-		buf.Write(pktStr("shallow " + s + "\n"))
-	}
-	for _, s := range plan.unshallow {
-		buf.Write(pktStr("unshallow " + s + "\n"))
-	}
-	buf.Write(delimPkt)
-	buf.Write(pktStr("packfile\n"))
-	buf.Write(sidebandPack(pack))
-	buf.Write(flushPkt)
-	return buf.Bytes()
+	return r.fetchResponse("v2", wants, haves, shallowIn, depth, done)
 }
 
 func handleFetchV0(r *repo, body []byte) []byte {
@@ -368,20 +397,7 @@ func handleFetchV0(r *repo, body []byte) []byte {
 			wants[i] = w[:sp]
 		}
 	}
-	plan := r.planFetch(wants, haves, shallowIn, depth)
-	key := fetchCacheKey(r.Ver, wants, haves, shallowIn, depth)
-	pack := r.buildFetchPack(plan, key)
-	var buf bytes.Buffer
-	buf.Write(pktStr("NAK\n"))
-	for _, s := range plan.shallow {
-		buf.Write(pktStr("shallow " + s + "\n"))
-	}
-	for _, s := range plan.unshallow {
-		buf.Write(pktStr("unshallow " + s + "\n"))
-	}
-	buf.Write(sidebandPack(pack))
-	buf.Write(flushPkt)
-	return buf.Bytes()
+	return r.fetchResponse("v0", wants, haves, shallowIn, depth, false)
 }
 
 type pushCmd struct {

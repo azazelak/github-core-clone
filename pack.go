@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/zlib"
 	"encoding/binary"
 	"encoding/hex"
@@ -173,6 +174,45 @@ func (c *countingReader) ReadByte() (byte, error) {
 }
 
 func inflateAt(pack []byte, off, limit int) ([]byte, int, error) {
+	// zlib stream: 2-byte header, raw deflate data, 4-byte Adler-32.
+	// The counting reader implements io.ByteReader, so the flate reader
+	// consumes exactly the stream bytes (no read-ahead past its end).
+	if off+6 > limit {
+		return nil, 0, errPack
+	}
+	// Validate the zlib header the way zlib.NewReader would: CM must be
+	// deflate (8) and the FCHECK checksum must hold; anything else falls
+	// back to the strict zlib path (which reports the real error).
+	b0, b1 := pack[off], pack[off+1]
+	if b0&0x0f != 8 || (int(b0)*256+int(b1))%31 != 0 {
+		return inflateAtZlib(pack, off, limit)
+	}
+	cr := &countingReader{r: bytes.NewReader(pack[off+2 : limit])}
+	rc := flatePool.Get().(io.ReadCloser)
+	rs, ok := rc.(flate.Resetter)
+	if !ok || rs.Reset(cr, nil) != nil {
+		flatePool.Put(rc)
+		return inflateAtZlib(pack, off, limit)
+	}
+	data, err := io.ReadAll(rc)
+	flatePool.Put(rc)
+	if err != nil {
+		return nil, 0, err
+	}
+	next := off + 2 + cr.n + 4 // header + deflate bytes + Adler-32
+	if next > limit {
+		return nil, 0, errPack
+	}
+	return data, next, nil
+}
+
+// flatePool reuses flate decompressors: zlib.NewReader allocates fresh
+// Huffman tables per object, and a push inflates every object it carries.
+var flatePool = sync.Pool{
+	New: func() any { return flate.NewReader(bytes.NewReader(nil)) },
+}
+
+func inflateAtZlib(pack []byte, off, limit int) ([]byte, int, error) {
 	cr := &countingReader{r: bytes.NewReader(pack[off:limit])}
 	zr, err := zlib.NewReader(cr)
 	if err != nil {

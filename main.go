@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 )
@@ -71,6 +72,9 @@ func waitDone(client *http.Client) {
 }
 
 func main() {
+	// The live set is small (a few MB of objects); collecting rarely
+	// trades a little heap for measurably less GC CPU on the hot paths.
+	debug.SetGCPercent(500)
 	if envURL == "" {
 		fmt.Fprintln(os.Stderr, "[forge] MAKEFUN_ENV_URL is not set")
 		os.Exit(1)

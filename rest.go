@@ -98,8 +98,100 @@ func issueJSONObj(r *repo, iss *issue) jmap {
 }
 
 func issueJSON(r *repo, iss *issue) []byte {
-	b, _ := json.Marshal(issueJSONObj(r, iss))
-	return append(b, '\n')
+	return issueJSONFast(r, iss)
+}
+
+// appendJSONString appends s as a JSON string literal. It escapes quotes,
+// backslashes and control characters exactly like encoding/json does for
+// the values we emit; '<', '>' and '&' are left literal, which parses to
+// the identical string (encoding/json would write \u003c etc.).
+func appendJSONString(dst []byte, s string) []byte {
+	dst = append(dst, '"')
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c == '"' || c == '\\' {
+			dst = append(dst, s[start:i]...)
+			switch c {
+			case '"':
+				dst = append(dst, '\\', '"')
+			case '\\':
+				dst = append(dst, '\\', '\\')
+			case '\n':
+				dst = append(dst, '\\', 'n')
+			case '\r':
+				dst = append(dst, '\\', 'r')
+			case '\t':
+				dst = append(dst, '\\', 't')
+			default:
+				dst = append(dst, '\\', 'u', '0', '0', hexDigits[c>>4], hexDigits[c&0xf])
+			}
+			start = i + 1
+		}
+	}
+	dst = append(dst, s[start:]...)
+	return append(dst, '"')
+}
+
+const hexDigits = "0123456789abcdef"
+
+// issueJSONFast builds the same JSON object issueJSONObj describes, but
+// by hand: no map allocation, no reflection, no key sorting. The issue
+// create response is the write workload's hot path, and the cached bytes
+// serve the read workload too.
+func issueJSONFast(r *repo, iss *issue) []byte {
+	id := gid("Issue", strconv.Itoa(r.ID)+":"+strconv.Itoa(iss.Number))
+	num := strconv.Itoa(iss.Number)
+	repoID := strconv.Itoa(r.ID)
+	buf := make([]byte, 0, 512+len(iss.Title)+len(iss.Body))
+	buf = append(buf, '{')
+	buf = append(buf, `"id":`...)
+	buf = appendJSONString(buf, id)
+	buf = append(buf, `,"node_id":`...)
+	buf = appendJSONString(buf, id)
+	buf = append(buf, `,"number":`...)
+	buf = strconv.AppendInt(buf, int64(iss.Number), 10)
+	buf = append(buf, `,"title":`...)
+	buf = appendJSONString(buf, iss.Title)
+	buf = append(buf, `,"body":`...)
+	buf = appendJSONString(buf, iss.Body)
+	buf = append(buf, `,"state":`...)
+	buf = appendJSONString(buf, iss.State)
+	buf = append(buf, `,"labels":[`...)
+	for i, l := range iss.Labels {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, `{"id":`...)
+		buf = appendJSONString(buf, gid("Label", repoID+":"+l.Name))
+		buf = append(buf, `,"name":`...)
+		buf = appendJSONString(buf, l.Name)
+		buf = append(buf, `,"color":`...)
+		buf = appendJSONString(buf, l.Color)
+		buf = append(buf, `,"description":""}`...)
+	}
+	buf = append(buf, `],"user":{"login":`...)
+	buf = appendJSONString(buf, viewerLogin)
+	buf = append(buf, `,"id":1000,"type":"User"}`...)
+	buf = append(buf, `,"assignee":null,"assignees":[],"milestone":null,"locked":false,"comments":`...)
+	buf = strconv.AppendInt(buf, int64(len(iss.Comments)), 10)
+	buf = append(buf, `,"created_at":`...)
+	buf = appendJSONString(buf, nowISO)
+	buf = append(buf, `,"updated_at":`...)
+	buf = appendJSONString(buf, nowISO)
+	buf = append(buf, `,"closed_at":`...)
+	if iss.State == "closed" {
+		buf = appendJSONString(buf, nowISO)
+	} else {
+		buf = append(buf, "null"...)
+	}
+	buf = append(buf, `,"html_url":`...)
+	buf = appendJSONString(buf, "https://github.com/"+r.Owner+"/"+r.Name+"/issues/"+num)
+	buf = append(buf, `,"url":`...)
+	buf = appendJSONString(buf, "/api/v3/repos/"+r.Owner+"/"+r.Name+"/issues/"+num)
+	buf = append(buf, `,"repository_url":`...)
+	buf = appendJSONString(buf, "/api/v3/repos/"+r.Owner+"/"+r.Name)
+	buf = append(buf, "}\n"...)
+	return buf
 }
 
 func (r *repo) issueJSONCached(iss *issue) []byte {

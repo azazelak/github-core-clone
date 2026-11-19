@@ -107,6 +107,53 @@ func (t objType) name() string {
 type gitObj struct {
 	typ  objType
 	data []byte
+	// Lazily filled parse caches (all access is under the store mutex,
+	// so no extra synchronisation is needed). Commits and trees are
+	// immutable, so a parsed view never goes stale.
+	parsed    bool
+	cParents  []string
+	cTree     string
+	entries   []treeEntry
+	entriesOK bool
+}
+
+// commitParents returns the commit's parent OIDs, parsing the object
+// data at most once.
+func (o *gitObj) commitParents() []string {
+	if o.typ != objCommit {
+		return nil
+	}
+	if !o.parsed {
+		c := parseCommit(o.data)
+		o.cParents, o.cTree = c.parents, c.tree
+		o.parsed = true
+	}
+	return o.cParents
+}
+
+// commitTree returns the commit's tree OID, parsing at most once.
+func (o *gitObj) commitTree() string {
+	if o.typ != objCommit {
+		return ""
+	}
+	if !o.parsed {
+		c := parseCommit(o.data)
+		o.cParents, o.cTree = c.parents, c.tree
+		o.parsed = true
+	}
+	return o.cTree
+}
+
+// treeEntries returns the tree's entries, parsing at most once.
+func (o *gitObj) treeEntries() []treeEntry {
+	if o.typ != objTree {
+		return nil
+	}
+	if !o.entriesOK {
+		o.entries = parseTree(o.data)
+		o.entriesOK = true
+	}
+	return o.entries
 }
 
 func hashObj(t objType, data []byte) string {
@@ -316,6 +363,10 @@ type repo struct {
 	issueCache map[int]cachedJSON
 	fetchCache map[string][]byte
 	fetchOrder []string
+	// fetchRespCache holds whole fetch responses (framing + pack) keyed
+	// the same way as fetchCache; a hit skips plan + pack entirely.
+	fetchRespCache map[string][]byte
+	fetchRespOrder []string
 }
 
 type cachedJSON struct {
@@ -328,15 +379,9 @@ type store struct {
 	repos       map[string]*repo
 	storeSeq    int
 	repoCounter int
-	reqCounter  int
 }
 
 var st = &store{repos: make(map[string]*repo)}
-
-func (s *store) nextReqID() string {
-	s.reqCounter++
-	return "req-" + strconv.Itoa(s.reqCounter)
-}
 
 func repoKey(owner, name string) string { return owner + "/" + name }
 
@@ -350,8 +395,9 @@ func (s *store) createRepo(name string, priv bool, description string) *repo {
 		Issues: make(map[int]*issue), Pulls: make(map[int]*pull),
 		Labels:     make(map[string]*label),
 		NextNumber: 1, NextComment: 1, CreatedSeq: s.storeSeq,
-		issueCache: make(map[int]cachedJSON),
-		fetchCache: make(map[string][]byte),
+		issueCache:     make(map[int]cachedJSON),
+		fetchCache:     make(map[string][]byte),
+		fetchRespCache: make(map[string][]byte),
 	}
 	s.repos[repoKey(viewerLogin, name)] = r
 	return r
@@ -440,7 +486,7 @@ func (r *repo) commitDistances(roots []string, maxDepth int) map[string]int {
 		if maxDepth >= 0 && it.d >= maxDepth {
 			continue
 		}
-		for _, p := range parseCommit(o.data).parents {
+		for _, p := range o.commitParents() {
 			if _, ok := dist[p]; !ok {
 				queue = append(queue, item{p, it.d + 1})
 			}
@@ -470,13 +516,12 @@ func (r *repo) reachable(roots []string) map[string]bool {
 		seen[oid] = true
 		switch o.typ {
 		case objCommit:
-			c := parseCommit(o.data)
-			stack = append(stack, c.tree)
-			stack = append(stack, c.parents...)
+			stack = append(stack, o.commitTree())
+			stack = append(stack, o.commitParents()...)
 		case objTag:
 			stack = append(stack, parseTag(o.data).object)
 		case objTree:
-			for _, e := range parseTree(o.data) {
+			for _, e := range o.treeEntries() {
 				if e.mode != "160000" {
 					stack = append(stack, e.oid)
 				}
@@ -503,7 +548,7 @@ func (r *repo) isAncestor(anc, tip string) bool {
 		}
 		seen[oid] = true
 		if o, ok := r.Objects[oid]; ok && o.typ == objCommit {
-			stack = append(stack, parseCommit(o.data).parents...)
+			stack = append(stack, o.commitParents()...)
 		}
 	}
 	return false
@@ -528,7 +573,7 @@ func (r *repo) flattenTree(treeOID, prefix string, out map[string]treeEntry) {
 	if !ok || o.typ != objTree {
 		return
 	}
-	for _, e := range parseTree(o.data) {
+	for _, e := range o.treeEntries() {
 		path := e.name
 		if prefix != "" {
 			path = prefix + "/" + e.name
@@ -544,7 +589,7 @@ func (r *repo) flattenTree(treeOID, prefix string, out map[string]treeEntry) {
 func (r *repo) treeOfCommit(commitOID string) map[string]treeEntry {
 	out := make(map[string]treeEntry)
 	if o, ok := r.Objects[commitOID]; ok && o.typ == objCommit {
-		r.flattenTree(parseCommit(o.data).tree, "", out)
+		r.flattenTree(o.commitTree(), "", out)
 	}
 	return out
 }
